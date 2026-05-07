@@ -1,0 +1,21 @@
+# Oracle wallet — NEVER commit credentials
+wallet/
+*.zip
+*.p12
+*.sso
+*.jks
+cwallet.sso
+ewallet.p12
+tnsnames.ora
+sqlnet.ora
+
+# SQLcl binary (downloaded in CI)
+sqlcl/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp

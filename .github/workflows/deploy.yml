@@ -1,0 +1,147 @@
+# =============================================================
+# GitHub Actions — Deploy Sales Dashboard to OCI Autonomous DB
+# =============================================================
+#
+# Required GitHub Secrets (Settings > Secrets > Actions):
+#   OCI_DB_USERNAME  — ADB schema user, e.g. ADMIN
+#   OCI_DB_PASSWORD  — ADB schema password
+#   OCI_DB_SERVICE   — TNS alias, e.g. myapextestdb_high
+#   OCI_WALLET_B64   — Base64-encoded wallet.zip
+#                      Linux:   base64 -w 0 wallet.zip
+#                      Windows: [Convert]::ToBase64String([IO.File]::ReadAllBytes('.\wallet.zip'))
+# =============================================================
+
+name: Deploy to OCI ADB
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'sql/**'
+      - 'scripts/**'
+  workflow_dispatch:
+    inputs:
+      include_sample_data:
+        description: 'Load sample data? (first deploy only)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  deploy-schema:
+    name: Deploy Schema to OCI ADB
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      # --------------------------------------------------------
+      # 1. Checkout
+      # --------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # 2. Java — SQLcl requires JDK 11+
+      # --------------------------------------------------------
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # --------------------------------------------------------
+      # 3. Cache SQLcl binary
+      # --------------------------------------------------------
+      - name: Cache SQLcl
+        id: cache-sqlcl
+        uses: actions/cache@v4
+        with:
+          path: sqlcl
+          key: sqlcl-latest-${{ runner.os }}
+
+      - name: Download SQLcl
+        if: steps.cache-sqlcl.outputs.cache-hit != 'true'
+        run: |
+          echo "Downloading Oracle SQLcl ..."
+          curl -fsSL -o sqlcl.zip \
+            "https://download.oracle.com/otn_software/java/sqldeveloper/sqlcl-latest.zip"
+          unzip -q sqlcl.zip
+          rm sqlcl.zip
+          chmod +x sqlcl/bin/sql
+          echo "SQLcl version:"
+          sqlcl/bin/sql -version
+
+      # --------------------------------------------------------
+      # 4. Extract OCI Wallet
+      # --------------------------------------------------------
+      - name: Extract OCI Wallet
+        run: |
+          mkdir -p wallet
+          echo "${{ secrets.OCI_WALLET_B64 }}" | base64 --decode > wallet/wallet.zip
+          unzip -q wallet/wallet.zip -d wallet/
+          rm wallet/wallet.zip
+          echo "TNS_ADMIN=${{ github.workspace }}/wallet" >> "$GITHUB_ENV"
+          # Verify wallet contents (no sensitive output)
+          echo "Wallet files present: $(ls wallet/ | tr '\n' ' ')"
+
+      # --------------------------------------------------------
+      # 5. Deploy schema (DDL + views)
+      # --------------------------------------------------------
+      - name: Deploy Schema
+        env:
+          DB_USER: ${{ secrets.OCI_DB_USERNAME }}
+          DB_PASS: ${{ secrets.OCI_DB_PASSWORD }}
+          DB_SERVICE: ${{ secrets.OCI_DB_SERVICE }}
+        run: |
+          echo "Deploying schema to ${DB_SERVICE} ..."
+          sqlcl/bin/sql -s \
+            "${DB_USER}/${DB_PASS}@${DB_SERVICE}" \
+            @scripts/deploy.sql
+
+      # --------------------------------------------------------
+      # 6. (Optional) Load sample data — manual trigger only
+      # --------------------------------------------------------
+      - name: Load Sample Data
+        if: |
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.include_sample_data == 'true'
+        env:
+          DB_USER: ${{ secrets.OCI_DB_USERNAME }}
+          DB_PASS: ${{ secrets.OCI_DB_PASSWORD }}
+          DB_SERVICE: ${{ secrets.OCI_DB_SERVICE }}
+        run: |
+          echo "Loading sample data ..."
+          sqlcl/bin/sql -s \
+            "${DB_USER}/${DB_PASS}@${DB_SERVICE}" \
+            @scripts/deploy_data.sql
+
+      # --------------------------------------------------------
+      # 7. Verify deployed objects
+      # --------------------------------------------------------
+      - name: Verify Deployed Objects
+        env:
+          DB_USER: ${{ secrets.OCI_DB_USERNAME }}
+          DB_PASS: ${{ secrets.OCI_DB_PASSWORD }}
+          DB_SERVICE: ${{ secrets.OCI_DB_SERVICE }}
+        run: |
+          sqlcl/bin/sql -s \
+            "${DB_USER}/${DB_PASS}@${DB_SERVICE}" << 'EOF'
+          SET PAGESIZE 50
+          SET LINESIZE 120
+          SELECT object_name, object_type, status
+          FROM   user_objects
+          WHERE  object_name LIKE 'SD_%'
+          ORDER  BY object_type, object_name;
+          EXIT 0
+          EOF
+
+      # --------------------------------------------------------
+      # 8. Cleanup — remove wallet from runner
+      # --------------------------------------------------------
+      - name: Cleanup Wallet
+        if: always()
+        run: rm -rf wallet/
